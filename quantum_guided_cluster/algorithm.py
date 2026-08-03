@@ -22,7 +22,7 @@ from typing import Literal
 import networkx as nx
 import numpy as np
 
-from divi.backends import QiskitSimulator
+from divi.backends import MaestroSimulator
 from divi.qprog import QAOA, EarlyStopping
 from divi.qprog.problems import MaxCutProblem
 from divi.qprog.optimizers import PymooOptimizer, PymooMethod
@@ -121,14 +121,14 @@ def extract_qaoa_correlations(
         patience: EarlyStopping patience.
         shots: Number of measurement shots.
         use_qdrift: If True, use QDrift trotterization for shallower circuits.
-        backend: Divi backend. Defaults to QiskitSimulator.
+        backend: Divi backend. Defaults to MaestroSimulator.
 
     Returns:
         CorrelationResult — Z matrix plus metadata for plots/tables.
     """
     n = G.number_of_nodes()
     if backend is None:
-        backend = QiskitSimulator(shots=shots)
+        backend = MaestroSimulator(shots=shots)
 
     qaoa_kwargs = dict(
         problem=MaxCutProblem(G),
@@ -522,18 +522,19 @@ def extract_pce_correlations(
         max_iterations: Optimizer iterations.
         alpha: PCE soft-relaxation parameter (lower = smoother gradient).
         shots: Number of measurement shots.
-        backend: Divi backend. Defaults to QiskitSimulator.
+        backend: Divi backend. Defaults to MaestroSimulator.
 
     Returns:
         CorrelationResult — Z matrix plus metadata.
     """
     # Lazy import keeps PCE optional for the QAOA-only path.
     from divi.qprog import PCE
+    from divi.qprog.problems import BinaryOptimizationProblem
 
     n = G.number_of_nodes()
     Q = maxcut_to_qubo(G)
     if backend is None:
-        backend = QiskitSimulator(shots=shots)
+        backend = MaestroSimulator(shots=shots)
 
     # PCE's UCCSD ansatz needs n_electrons set, even, and < n_qubits — but
     # n_qubits depends on the encoding. Mirror divi's encoding formulas so
@@ -545,7 +546,7 @@ def extract_pce_correlations(
     n_electrons = max(2, (n_qubits - 2) // 2 * 2)
 
     pce = PCE(
-        Q,
+        BinaryOptimizationProblem(Q),
         encoding_type=encoding,
         n_qubits=n_qubits,
         n_electrons=n_electrons,
@@ -586,4 +587,3 @@ def extract_pce_correlations(
         elapsed=elapsed,
         instance=pce,
     )
-

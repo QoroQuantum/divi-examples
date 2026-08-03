@@ -17,8 +17,8 @@ import json
 import os
 
 import numpy as np
-import pennylane as qp
-from birkhoff import combination_to_integer, run_birkhoff
+from qiskit.circuit.library import CZGate, RYGate
+from birkhoff import combination_to_integer, describe_top_outcomes, run_birkhoff
 from divi.backends import MaestroSimulator
 from divi.qprog import GenericLayerAnsatz
 from divi.qprog.optimizers import MonteCarloOptimizer, ScipyMethod, ScipyOptimizer
@@ -240,7 +240,9 @@ def main(args):
         raise ValueError(f"Unsupported optimizer type: {OPTIMIZER_TYPE}")
 
     backend = MaestroSimulator(shots=5000)
-    ansatz = GenericLayerAnsatz([qp.RY], entangler=qp.CZ, entangling_layout="brick")
+    ansatz = GenericLayerAnsatz(
+        [RYGate], entangler=CZGate, entangling_layout="brick"
+    )
 
     print("Starting optimization...")
     result = run_birkhoff(
@@ -261,6 +263,19 @@ def main(args):
             "outcomes."
         )
         return
+
+    print("\nMost frequent measured outcomes:")
+    for row in describe_top_outcomes(
+        result.final_histogram,
+        K_COMBINATIONS,
+        matrix,
+        all_permutation_matrices,
+        scale,
+    ):
+        print(
+            f"  {row['bitstring']}: {row['shots']} shots → "
+            f"permutations {row['combination']}, error={row['error']:.6f}"
+        )
 
     present_final_results(
         original_matrix_scaled=matrix,

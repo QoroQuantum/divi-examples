@@ -7,7 +7,7 @@
 #    Phase 1 (export):  Build Trotter circuits and save them as QASM files.
 #       python neel_dynamics.py export --n-qubits 15
 #
-#    Phase 2 (run):     Run exact baseline, reload (compressed) QASM circuits,
+#    Run:               Run exact baseline, reload (compressed) QASM circuits,
 #                       run QDrift, and compare all three.
 #       python neel_dynamics.py run --n-qubits 15 --compressed-dir compressed_circuits
 #
@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pennylane as qml
 
-from divi.backends import QiskitSimulator, QoroService, JobConfig
+from divi.backends import MaestroSimulator, QoroService, JobConfig
 from divi.circuits import qscript_to_meta, dag_to_qasm_body
 from divi.qprog import CustomPerQubitState, TimeEvolution
 from divi.hamiltonians import ExactTrotterization, QDrift
@@ -176,7 +176,7 @@ def phase_export(args):
         if f.endswith(".qasm"):
             os.remove(os.path.join(output_dir, f))
 
-    # Save time points metadata so Phase 2 knows the mapping
+    # Save time-point metadata for the reload step.
     times_file = os.path.join(output_dir, "times.npy")
     np.save(times_file, times)
 
@@ -198,7 +198,13 @@ def phase_export(args):
         measure_lines = "".join(
             f"measure q[{w}] -> c[{w}];\n" for w in range(N_QUBITS)
         )
-        full_qasm = body_qasm + measure_lines
+        qasm_header = (
+            "OPENQASM 2.0;\n"
+            'include "qelib1.inc";\n'
+            f"qreg q[{N_QUBITS}];\n"
+            f"creg c[{N_QUBITS}];\n"
+        )
+        full_qasm = qasm_header + body_qasm + measure_lines
 
         filepath = os.path.join(output_dir, f"neel_t{i:03d}.qasm")
         with open(filepath, "w") as f:
@@ -211,7 +217,7 @@ def phase_export(args):
 
 
 # =====================================================================
-#  Phase 2 — RUN: Exact baseline, compressed QASM reload, QDrift
+#  RUN: Exact baseline, compressed QASM reload, QDrift
 # =====================================================================
 
 def phase_run(args):
@@ -229,8 +235,8 @@ def phase_run(args):
     neel_state = "10" * (N_QUBITS // 2) + ("1" if N_QUBITS % 2 else "")
 
     # --- Backends ---
-    local_backend = QiskitSimulator(shots=SHOTS, track_depth=True)
-    print("Local backend: QiskitSimulator (SV reference)")
+    local_backend = MaestroSimulator(shots=SHOTS, track_depth=True)
+    print("Local backend: MaestroSimulator (statevector reference)")
     if args.cloud:
         cloud_backend = QoroService(job_config=JobConfig(shots=SHOTS, force_sampling=True))
         print("Cloud backend: QoroService")

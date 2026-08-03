@@ -6,7 +6,7 @@ solves a two-step classical approximation (integer LP + sparsification)
 for the best convex combination of the decoded permutations against a
 target doubly-stochastic matrix.
 
-The pipeline (``PennyLaneSpecStage → MeasurementStage(COUNTS) →
+The pipeline (``QiskitSpecStage → MeasurementStage(COUNTS) →
 ParameterBindingStage``) maps parameter sets to raw shot histograms.  A
 Divi optimizer (``ScipyOptimizer`` / ``MonteCarloOptimizer``) drives the
 loop through its ``optimize(cost_fn, initial_params, ...)`` API.
@@ -20,15 +20,13 @@ from functools import cache
 from itertools import repeat
 
 import numpy as np
-import pennylane as qp
 from divi.backends import CircuitRunner
-from divi.pipeline import CircuitPipeline, PipelineEnv
+from divi.pipeline import CircuitPipeline, PipelineEnv, ResultFormat
 from divi.pipeline.stages import (
     MeasurementStage,
     ParameterBindingStage,
-    PennyLaneSpecStage,
+    QiskitSpecStage,
 )
-from divi.pipeline.stages._measurement_stage import ResultFormat
 from divi.qprog import Ansatz, GenericLayerAnsatz
 from divi.qprog.optimizers import (
     MonteCarloOptimizer,
@@ -37,7 +35,8 @@ from divi.qprog.optimizers import (
     ScipyOptimizer,
 )
 from docplex.mp.model import Model
-from qiskit.circuit import ParameterVector
+from qiskit.circuit import ClassicalRegister, ParameterVector
+from qiskit.circuit.library import CZGate, RYGate
 
 
 # --------------------------------------------------------------------------- #
@@ -176,25 +175,25 @@ def black_box_optimizer(
 # --------------------------------------------------------------------------- #
 
 
-def build_parameterized_qscript(
-    ansatz: Ansatz, n_qubits: int, n_layers: int
-) -> qp.tape.QuantumScript:
-    """Build a parameterized PennyLane QuantumScript with a probs measurement."""
+def build_parameterized_circuit(ansatz: Ansatz, n_qubits: int, n_layers: int):
+    """Build a parameterized Qiskit circuit with a counts measurement."""
     n_params_per_layer = ansatz.n_params_per_layer(n_qubits)
     weights = np.array(
         [ParameterVector(f"w_{i}", n_params_per_layer) for i in range(n_layers)],
         dtype=object,
     )
 
-    ops = ansatz.build(weights, n_qubits=n_qubits, n_layers=n_layers)
-    return qp.tape.QuantumScript(ops=ops, measurements=[qp.probs()])
+    circuit = ansatz.build(weights, n_qubits=n_qubits, n_layers=n_layers)
+    circuit.add_register(ClassicalRegister(n_qubits, "meas"))
+    circuit.measure(range(n_qubits), range(n_qubits))
+    return circuit
 
 
 def build_pipeline() -> CircuitPipeline:
     """A standalone pipeline that emits raw shot histograms per param-set."""
     return CircuitPipeline(
         stages=[
-            PennyLaneSpecStage(),
+            QiskitSpecStage(),
             MeasurementStage(result_format_override=ResultFormat.COUNTS),
             ParameterBindingStage(),
         ]
@@ -316,6 +315,27 @@ class BirkhoffResult:
     best_params: np.ndarray | None = None
 
 
+def describe_top_outcomes(
+    histogram: dict[str, int],
+    k: int,
+    target_matrix: np.ndarray,
+    all_permutation_matrices: np.ndarray,
+    scale: int,
+    limit: int = 5,
+) -> list[dict]:
+    """Decode frequent bitstrings and attach their reconstruction error."""
+    flattened = all_permutation_matrices.reshape(all_permutation_matrices.shape[0], -1)
+    rows = []
+    for bitstring, count in sorted(histogram.items(), key=lambda item: item[1], reverse=True)[:limit]:
+        try:
+            combination = integer_to_combination(int(bitstring, 2), k)
+        except (ValueError, IndexError):
+            continue
+        _, error, _ = black_box_optimizer(tuple(combination), target_matrix, flattened, scale)
+        rows.append({"bitstring": bitstring, "shots": count, "combination": combination, "error": error})
+    return rows
+
+
 def run_birkhoff(
     matrix: np.ndarray,
     scale: int,
@@ -338,7 +358,7 @@ def run_birkhoff(
         all_perms_matrix: ``(num_perms, n, n)`` stack of all candidate
             permutation matrices to draw from.
         backend: A Divi ``CircuitRunner`` (e.g. ``MaestroSimulator``,
-            ``QiskitSimulator``, or ``QoroService``).
+            ``MaestroSimulator``, or ``QoroService``).
         optimizer: Any Divi ``Optimizer`` exposing ``optimize(cost_fn, ...)``.
         max_iterations: Optimizer iteration cap.
         ansatz: PennyLane ansatz; defaults to a brick-layout RY+CZ.
@@ -358,9 +378,11 @@ def run_birkhoff(
     penalty_value = float(np.linalg.norm(target_unscaled_flat, ord=2))
 
     if ansatz is None:
-        ansatz = GenericLayerAnsatz([qp.RY], entangler=qp.CZ, entangling_layout="brick")
+        ansatz = GenericLayerAnsatz(
+            [RYGate], entangler=CZGate, entangling_layout="brick"
+        )
 
-    qscript = build_parameterized_qscript(ansatz, n_qubits, n_layers)
+    circuit = build_parameterized_circuit(ansatz, n_qubits, n_layers)
     pipeline = build_pipeline()
 
     @cache
@@ -383,7 +405,7 @@ def run_birkhoff(
         def cost_fn(params: np.ndarray) -> float | np.ndarray:
             param_sets = np.atleast_2d(params)
             env = PipelineEnv(backend=backend, param_sets=param_sets)
-            result = pipeline.run(initial_spec=qscript, env=env)
+            result = pipeline.run(initial_spec=circuit, env=env)
             state["circuit_count"] += env.artifacts.get("circuit_count", 0)
             state["run_time"] += env.artifacts.get("run_time", 0.0)
 
@@ -455,7 +477,7 @@ def run_birkhoff(
         )
 
         env = PipelineEnv(backend=backend, param_sets=best_params)
-        final_result = pipeline.run(initial_spec=qscript, env=env)
+        final_result = pipeline.run(initial_spec=circuit, env=env)
     state["circuit_count"] += env.artifacts.get("circuit_count", 0)
     state["run_time"] += env.artifacts.get("run_time", 0.0)
     final_histogram: dict[str, int] = next(iter(final_result.values()))

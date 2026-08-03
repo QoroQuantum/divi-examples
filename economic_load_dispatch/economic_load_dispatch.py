@@ -11,10 +11,12 @@
 
 import dimod
 import pennylane as qml
+from qiskit.circuit.library import CXGate, RYGate, RZGate
 import time
 
-from divi.backends import QiskitSimulator, QoroService, JobConfig
+from divi.backends import MaestroSimulator, QoroService, JobConfig
 from divi.qprog import PCE, GenericLayerAnsatz
+from divi.qprog.problems import BinaryOptimizationProblem
 from divi.qprog.optimizers import PymooMethod, PymooOptimizer
 from divi.hamiltonians import qubo_to_matrix
 
@@ -54,11 +56,7 @@ def define_generators():
 
 
 def define_generators_large():
-    """Define a 6-generator grid (Phase 2 — cloud scale-up).
-
-    Double the generators: 24 binary variables → ~8 PCE qubits.
-    QoroService parallelises the circuit evaluations on Maestro.
-    """
+    """Define a six-generator variant for exploring the same formulation."""
     return define_generators() + [
         {
             "name": "Gen 4", "a": 18, "b": 1.7, "c": 0.012,
@@ -221,7 +219,7 @@ def classical_sa_solve(generators, demand, bqm, num_reads=1000):
         valid = True
         for g, gen in enumerate(generators):
             p = gen["P_min"] + STEP_MW * sum(
-                BIT_WEIGHTS[b] * sample.get(_qubit_name(g, b), 0)
+                BIT_WEIGHTS[b] * int(sample.get(_qubit_name(g, b), 0))
                 for b in range(N_QUBITS_PER_GEN)
             )
             if gen["poz_low"] <= p <= gen["poz_high"]:
@@ -258,24 +256,24 @@ def solve_with_pce(bqm, n_layers=3, max_iterations=20, alpha=3.0,
         alpha:            binary activation hardness (higher = sharper)
         population_size:  DE population per generation
         shots:            measurement samples per circuit evaluation
-        backend:          Divi backend (QiskitSimulator or QoroService)
+        backend:          Divi backend (MaestroSimulator or QoroService)
 
     Returns:
         pce_solver:  the solved PCE object (access .solution, .get_top_solutions)
     """
     if backend is None:
-        backend = QiskitSimulator(shots=shots)
+        backend = MaestroSimulator(shots=shots)
 
     qubo_mat = qubo_to_matrix(bqm)
 
     ansatz = GenericLayerAnsatz(
-        gate_sequence=[qml.RY, qml.RZ],
-        entangler=qml.CNOT,
+        gate_sequence=[RYGate, RZGate],
+        entangler=CXGate,
         entangling_layout="all-to-all",
     )
 
     pce_solver = PCE(
-        qubo_mat,
+        BinaryOptimizationProblem(qubo_mat),
         ansatz=ansatz,
         n_layers=n_layers,
         encoding_type="poly",
@@ -354,6 +352,55 @@ def repair_solution(powers, generators, demand):
     return ps if sum(ps) == demand else None
 
 
+def dispatch_feasibility_report(powers, generators, demand):
+    """Return constraint diagnostics for a decoded generator dispatch."""
+    powers = [int(power) for power in powers]
+    prohibited = [
+        i
+        for i, (power, gen) in enumerate(zip(powers, generators))
+        if gen["poz_low"] <= power <= gen["poz_high"]
+    ]
+    out_of_bounds = [
+        i
+        for i, (power, gen) in enumerate(zip(powers, generators))
+        if power < gen["P_min"] or power > gen["P_max"]
+    ]
+    total = sum(powers)
+    return {
+        "total_generation": total,
+        "demand_gap": demand - total,
+        "prohibited_generators": prohibited,
+        "out_of_bounds_generators": out_of_bounds,
+        "feasible": total == demand and not prohibited and not out_of_bounds,
+    }
+
+
+def penalty_sweep(generators, demand, penalties=(200, 2_000, 20_000)):
+    """Show how the demand-penalty weight changes the QUBO ground sample."""
+    rows = []
+    for penalty in penalties:
+        bqm, _ = build_qubo(generators, demand, penalty_lambda=penalty)
+        sample = dimod.ExactSolver().sample(bqm).first.sample
+        powers = [decode_power(g, generators, sample) for g in range(len(generators))]
+        rows.append((penalty, dispatch_feasibility_report(powers, generators, demand)))
+    return rows
+
+
+def print_dispatch_report(label, powers, generators, demand):
+    """Print the demand and generator-constraint status of one dispatch."""
+    report = dispatch_feasibility_report(powers, generators, demand)
+    print(f"\n   {label}")
+    print(
+        f"   total={report['total_generation']:.0f} MW, "
+        f"demand gap={report['demand_gap']:.0f} MW"
+    )
+    print(
+        f"   prohibited zones: {report['prohibited_generators'] or 'none'}; "
+        f"limits: {report['out_of_bounds_generators'] or 'none'}; "
+        f"feasible: {'yes' if report['feasible'] else 'no'}"
+    )
+
+
 def find_best_repaired_solution(pce_solver, bqm, generators, demand, top_n=20):
     """Scan the top quantum candidates and return the best repaired dispatch.
 
@@ -375,6 +422,7 @@ def find_best_repaired_solution(pce_solver, bqm, generators, demand, top_n=20):
 
         sample = {var: int(val) for var, val in zip(bqm.variables, sol.decoded)}
         ps = [decode_power(g, generators, sample) for g in range(len(generators))]
+        report = dispatch_feasibility_report(ps, generators, demand)
         cost = sum(fuel_cost(generators[g], ps[g]) for g in range(len(generators)))
         tot = sum(ps)
         valid = (
@@ -387,6 +435,11 @@ def find_best_repaired_solution(pce_solver, bqm, generators, demand, top_n=20):
         print(f"     {i:2d}. P=[{ps[0]:.0f},{ps[1]:.0f},{ps[2]:.0f}]  "
               f"Tot={tot:.0f}  Cost={cost:.0f}$  "
               f"Prob={sol.prob:.2%}  {'✅' if valid else '❌'}")
+        if i == 1:
+            print(
+                f"         demand gap={report['demand_gap']:.0f} MW; "
+                f"prohibited zones={report['prohibited_generators'] or 'none'}"
+            )
 
         repaired = repair_solution(ps, generators, demand)
         if repaired is not None:
@@ -433,16 +486,14 @@ if __name__ == "__main__":
     DEMAND = 195  # MW — how much power the grid needs
 
     # --- Backend selection ---
-    USE_CLOUD = False  # Set to True to use QoroService cloud backend
+    USE_QORO_SERVICE = False  # Optional backend; credentials must be configured.
 
-    if USE_CLOUD:
-        # QoroService reads QORO_API_KEY from your environment
-        # Get your API key at https://dash.qoroquantum.net
+    if USE_QORO_SERVICE:
         backend = QoroService(job_config=JobConfig(shots=10_000))
-        print("☁️  Using QoroService cloud backend")
+        print("Using QoroService backend")
     else:
-        backend = QiskitSimulator(shots=10_000)
-        print("💻 Using local QiskitSimulator")
+        backend = MaestroSimulator(shots=10_000)
+        print("Using local MaestroSimulator")
 
     # 1. Define the generators and their constraints
     generators = define_generators()
@@ -450,6 +501,12 @@ if __name__ == "__main__":
     # 2. Encode the problem as a QUBO (quantum-ready format)
     bqm, var_names = build_qubo(generators, demand=DEMAND)
     print(f"Built QUBO: {len(var_names)} variables, {len(bqm.quadratic)} interactions")
+    print("Demand-penalty sweep (QUBO ground samples):")
+    for penalty, report in penalty_sweep(generators, DEMAND):
+        print(
+            f"  λ={penalty:>5}: gap={report['demand_gap']:>4.0f} MW, "
+            f"prohibited={report['prohibited_generators'] or 'none'}"
+        )
 
     # 3. Find the classical optimum (for comparison)
     classical_best = classical_brute_force(generators, DEMAND, bqm)
@@ -470,18 +527,15 @@ if __name__ == "__main__":
         print(f"\n   → Best repaired solution: P1={powers[0]:.0f}, "
               f"P2={powers[1]:.0f}, P3={powers[2]:.0f} MW, "
               f"Cost={cost:.1f} $  (quantum seed prob={prob:.2%})")
+        print_dispatch_report("Repaired-solution feasibility", powers, generators, DEMAND)
 
         # 6. Compare quantum vs classical
         print_comparison(result, classical_best)
     else:
         print("\n   ⚠️  No valid solution found. Try increasing max_iterations.")
 
-    # =================================================================
-    #  PHASE 2 — 6 Generators with QoroService
-    # =================================================================
-
     print("\n" + "=" * 70)
-    print("  Phase 2 — 6 Generators with QoroService (24 binary vars, ~8 PCE qubits)")
+    print("  Six-generator variant (24 binary variables, about 8 PCE qubits)")
     print("=" * 70)
 
     generators_large = define_generators_large()
@@ -495,38 +549,30 @@ if __name__ == "__main__":
     if classical_large:
         print(f"Classical SA baseline: Cost = {classical_large[-1]:.1f} $")
 
-    cloud_backend = QoroService(job_config=JobConfig(shots=10_000))
-    print("\n☁️  Dispatching 6-generator PCE-VQE to Qoro Maestro...")
-    print(f"   {len(var_names_large)} binary vars encoded into fewer PCE qubits in parallel")
+    print("\nRunning the six-generator PCE-VQE variant...")
 
     t0 = time.time()
-    pce_solver_cloud = solve_with_pce(
+    pce_solver_large = solve_with_pce(
         bqm_large,
         n_layers=3,
         max_iterations=10,
         population_size=50,
-        backend=cloud_backend,
+        backend=backend,
     )
-    cloud_time = time.time() - t0
+    large_time = time.time() - t0
 
-    result_cloud = find_best_repaired_solution(
-        pce_solver_cloud, bqm_large, generators_large, DEMAND_LARGE
+    result_large = find_best_repaired_solution(
+        pce_solver_large, bqm_large, generators_large, DEMAND_LARGE
     )
 
-    if result_cloud is not None:
-        powers, cost, prob = result_cloud
+    if result_large is not None:
+        powers, cost, prob = result_large
         gen_str = ", ".join(f"P{i+1}={p:.0f}" for i, p in enumerate(powers))
         print(f"\n   → Best repaired solution: {gen_str} MW")
         print(f"     Total={sum(powers):.0f} MW, Cost={cost:.1f} $, "
               f"quantum seed prob={prob:.2%}")
         if classical_large:
-            print_comparison(result_cloud, classical_large)
+            print_comparison(result_large, classical_large)
 
-    print(f"\n   ⚡ Local  (Phase 1): {local_time:.1f}s for 3 generators ({len(var_names)} vars)")
-    print(f"   ⚡ Cloud  (Phase 2): {cloud_time:.1f}s for 6 generators ({len(var_names_large)} vars)")
-
-    print("\n" + "=" * 70)
-    print("  🎉 That's the power of QoroService.")
-    print("     Double the generators, cloud-parallel PCE-VQE on Maestro.")
-    print("     👉 https://dash.qoroquantum.net")
-    print("=" * 70)
+    print(f"\n   Three-generator run: {local_time:.1f}s ({len(var_names)} variables)")
+    print(f"   Six-generator run: {large_time:.1f}s ({len(var_names_large)} variables)")

@@ -3,7 +3,7 @@ Transverse-Field Ising Model (TFIM) spin dynamics via Divi.
 
 Demonstrates ``TimeEvolutionTrajectory``: instead of looping over time points
 one-by-one, the trajectory API creates one program per time point and executes
-them all in parallel — locally or on QoroService.
+them together on the selected backend.
 
 Tracks the magnetization ⟨Z₀⟩ for three physical regimes (ferromagnetic,
 paramagnetic, Néel-state) and compares Exact Trotterization against QDrift.
@@ -12,13 +12,10 @@ paramagnetic, Néel-state) and compares Exact Trotterization against QDrift.
 import time
 from dataclasses import dataclass
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pennylane as qml
 
-from divi.backends import QiskitSimulator, QoroService, JobConfig
+from divi.backends import MaestroSimulator, QoroService, JobConfig
 from divi.hamiltonians import ExactTrotterization, QDrift
 from divi.qprog import (
     CustomPerQubitState,
@@ -26,6 +23,7 @@ from divi.qprog import (
     TimeEvolutionTrajectory,
     ZerosState,
 )
+from plotting import absolute_trajectory_error, plot_dynamics, plot_trajectory_error
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -73,30 +71,6 @@ def run_trajectory(hamiltonian, time_points, strategy, backend,
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Plotting
-# ─────────────────────────────────────────────────────────────────────
-
-def plot_dynamics(times_exact, mag_exact, times_qdrift, mag_qdrift,
-                  title, filename):
-    """Plot Exact vs QDrift trajectories side by side."""
-    plt.figure(figsize=(10, 6))
-    plt.plot(times_exact, mag_exact, "o-", color="#3b82f6",
-             label="Exact Trotterization", linewidth=2, markersize=8)
-    plt.plot(times_qdrift, mag_qdrift, "s--", color="#f97316",
-             label="QDrift (stochastic)", linewidth=2, markersize=8)
-    plt.axhline(0, color="black", linestyle="-", alpha=0.2)
-    plt.title(title, fontsize=14, fontweight="bold")
-    plt.xlabel("Time (t)", fontsize=12)
-    plt.ylabel(r"Magnetization $\langle Z_0 \rangle$", fontsize=12)
-    plt.ylim(-1.1, 1.1)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300)
-    print(f"  Plot saved to {filename}")
-
-
-# ─────────────────────────────────────────────────────────────────────
 #  Experiment specs (declared once, looped over)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -135,6 +109,12 @@ def run_experiment(
         title=f"Spin Dynamics: {exp.name} (J={exp.J}, h={exp.h})",
         filename=exp.filename,
     )
+    plot_trajectory_error(
+        t_exact,
+        absolute_trajectory_error(m_exact, m_qdrift),
+        exp.name,
+        exp.filename.replace(".png", "_error.png"),
+    )
 
 
 # =====================================================================
@@ -145,14 +125,14 @@ if __name__ == "__main__":
     N_QUBITS = 6
     N_STEPS = 5
     T_MAX = 3.0
-    N_POINTS = 6  # Keep small locally; scale up with QoroService.
+    N_POINTS = 6
     SHOTS = 5_000
     USE_CLOUD = False
 
     backend = (
         QoroService(job_config=JobConfig(shots=SHOTS))
         if USE_CLOUD
-        else QiskitSimulator(shots=SHOTS)
+        else MaestroSimulator(shots=SHOTS)
     )
 
     # TimeEvolutionTrajectory needs t > 0 — skip t=0.

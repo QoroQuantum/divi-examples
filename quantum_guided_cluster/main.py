@@ -30,7 +30,71 @@ from plotting import (
     plot_energy_distribution,
 )
 
-from divi.backends import QiskitSimulator
+from divi.backends import MaestroSimulator
+
+
+def summarize_approximation_ratios(ratios_by_seed: dict[int, list[float]]) -> dict:
+    """Return mean and range summaries for repeated benchmark ratios."""
+    return {
+        depth: {
+            "mean": float(np.mean(ratios)),
+            "min": float(np.min(ratios)),
+            "max": float(np.max(ratios)),
+        }
+        for depth, ratios in ratios_by_seed.items()
+        if ratios
+    }
+
+
+def run_multiseed_benchmark(seeds: list[int], **benchmark_kwargs) -> dict:
+    """Repeat a benchmark and summarize QAOA-guided approximation ratios."""
+    ratios: dict[int, list[float]] = {}
+    for seed in seeds:
+        results = run_benchmark(seed=seed, **benchmark_kwargs)
+        ground = results["E_ground"]
+        if ground is None:
+            continue
+        for label, result in results["quantum_results"].items():
+            if label.startswith("QAOA p="):
+                depth = int(label.split("=")[1])
+                ratios.setdefault(depth, []).append(result.best_energy / ground)
+
+    summary = summarize_approximation_ratios(ratios)
+    print("\nMulti-seed QAOA-guided approximation ratios:")
+    for depth, values in sorted(summary.items()):
+        print(
+            f"  p={depth}: mean={values['mean']:.3f}, "
+            f"range=[{values['min']:.3f}, {values['max']:.3f}]"
+        )
+    return summary
+
+
+def exact_ground_energy(graph, n_nodes: int) -> float | None:
+    """Return the brute-force Ising ground energy when the graph is small."""
+    if n_nodes > 22:
+        return None
+    return min(
+        ising_energy(graph, np.array([1 - 2 * ((bits >> i) & 1) for i in range(n_nodes)]))
+        for bits in range(2**n_nodes)
+    )
+
+
+def select_backend(use_cloud: bool, shots: int):
+    """Construct the backend requested by the benchmark configuration."""
+    if use_cloud:
+        from divi.backends import JobConfig, QoroService
+
+        return QoroService(job_config=JobConfig(shots=shots)), "QoroService"
+    return MaestroSimulator(shots=shots), "MaestroSimulator"
+
+
+def format_result(label: str, result: ClusterAlgoResult, ground_energy, extra: str = "") -> str:
+    """Format one benchmark result consistently across classical and quantum runs."""
+    line = f"  [{label:<24}] best E = {result.best_energy:7.1f}"
+    if ground_energy is not None:
+        mean_ratio = float(np.mean([energy / ground_energy for energy in result.energy_history]))
+        line += f" | mean r = {mean_ratio:.3f} | best r = {result.best_energy / ground_energy:.3f}"
+    return f"{line} | {extra}" if extra else line
 
 
 def run_benchmark(
@@ -77,32 +141,12 @@ def run_benchmark(
     print(f"Graph: {n_nodes} nodes, {degree}-regular, {G.number_of_edges()} edges. "
           f"Budget: {n_iterations_factor}×n iters × {n_repetitions} restarts.")
 
-    # Brute-force ground state for n ≤ 22 — used for approximation ratios.
-    E_ground: float | None = None
-    if n_nodes <= 22:
-        E_ground = min(
-            ising_energy(G, np.array([1 - 2 * ((b >> i) & 1) for i in range(n_nodes)]))
-            for b in range(2**n_nodes)
-        )
+    E_ground = exact_ground_energy(G, n_nodes)
+    if E_ground is not None:
         print(f"Exact ground state: E₀ = {E_ground:.1f}")
 
-    if use_cloud:
-        from divi.backends import QoroService, JobConfig
-        backend = QoroService(job_config=JobConfig(shots=shots))
-        print(f"Backend: QoroService (shots={shots})")
-    else:
-        backend = QiskitSimulator(shots=shots)
-        print(f"Backend: QiskitSimulator (shots={shots})")
-
-    def _format(label: str, result: ClusterAlgoResult, *, extra: str = "") -> str:
-        line = f"  [{label:<24}] best E = {result.best_energy:7.1f}"
-        if E_ground is not None:
-            mean_r = float(np.mean([e / E_ground for e in result.energy_history]))
-            best_r = result.best_energy / E_ground
-            line += f" | mean r = {mean_r:.3f} | best r = {best_r:.3f}"
-        if extra:
-            line += f" | {extra}"
-        return line
+    backend, backend_name = select_backend(use_cloud, shots)
+    print(f"Backend: {backend_name} (shots={shots})")
 
     # SA baseline.
     t0 = time.time()
@@ -110,7 +154,7 @@ def run_benchmark(
         G, n_iterations_factor=n_iterations_factor,
         n_repetitions=n_repetitions, seed=seed,
     )
-    print(_format("SA", sa_result, extra=f"{time.time() - t0:.1f}s"))
+    print(format_result("SA", sa_result, E_ground, extra=f"{time.time() - t0:.1f}s"))
 
     # Coupling-constant cluster.
     Z_cc = coupling_constant_correlations(G)
@@ -119,7 +163,7 @@ def run_benchmark(
         G, Z_cc, n_iterations_factor=n_iterations_factor,
         n_repetitions=n_repetitions, lambda_scale=1, seed=seed,
     )
-    print(_format("Cluster (J coupling)", cc_result,
+    print(format_result("Cluster (J coupling)", cc_result, E_ground,
                   extra=f"accept={cc_result.acceptance_rate:.1%} | {time.time() - t0:.1f}s"))
 
     # Quantum-guided sources (QAOA + PCE share the same downstream pipeline).
@@ -149,8 +193,8 @@ def run_benchmark(
             n_repetitions=n_repetitions, lambda_scale=lambda_scale, seed=seed,
         )
         quantum_results[corr.label] = cluster_result
-        print(_format(
-            f"{corr.label}-Guided", cluster_result,
+        print(format_result(
+            f"{corr.label}-Guided", cluster_result, E_ground,
             extra=(f"accept={cluster_result.acceptance_rate:.1%} | "
                    f"circuits={corr.total_circuit_count} | {time.time() - t0:.1f}s"),
         ))
